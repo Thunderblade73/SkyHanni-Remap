@@ -11,6 +11,7 @@ import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
 import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
 import org.jetbrains.kotlin.cli.jvm.config.JavaSourceRoot
 import org.jetbrains.kotlin.cli.jvm.config.JvmClasspathRoot
+import org.jetbrains.kotlin.cli.jvm.config.VirtualJvmClasspathRoot
 import org.jetbrains.kotlin.cli.jvm.modules.CoreJrtFileSystem
 import org.jetbrains.kotlin.com.intellij.codeInsight.CustomExceptionHandler
 import org.jetbrains.kotlin.com.intellij.mock.MockProject
@@ -19,9 +20,7 @@ import org.jetbrains.kotlin.com.intellij.openapi.extensions.ExtensionPoint
 import org.jetbrains.kotlin.com.intellij.openapi.extensions.Extensions
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
 import org.jetbrains.kotlin.com.intellij.openapi.util.registry.Registry
-import org.jetbrains.kotlin.com.intellij.openapi.vfs.StandardFileSystems
-import org.jetbrains.kotlin.com.intellij.openapi.vfs.VirtualFileManager
-import org.jetbrains.kotlin.com.intellij.openapi.vfs.local.CoreLocalFileSystem
+import org.jetbrains.kotlin.com.intellij.openapi.vfs.VirtualFile
 import org.jetbrains.kotlin.com.intellij.psi.PsiManager
 import org.jetbrains.kotlin.config.CommonConfigurationKeys
 import org.jetbrains.kotlin.config.CompilerConfiguration
@@ -32,11 +31,42 @@ import java.io.BufferedReader
 import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
-import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.Paths
 import java.nio.file.StandardOpenOption
+import kotlin.io.path.pathString
 import kotlin.system.exitProcess
+
+private val fileDelimiter = Paths.get("/").pathString
+
+/**
+ * Build an in-memory VFS under TempFileSystem from a map of Unix-style paths to file contents.
+ * @param files  map of "dir1/dir2/file.ext" → fileText
+ * @return       map of the same keys to their created VirtualFile
+ */
+fun createMockFileSystem(files: Map<String, String>): Pair<Map<String, VirtualFile>, VirtualDirectory> {
+
+    // 1) grab the singleton TempFileSystem and its invisible root
+    val root = VirtualDirectory("", null)
+
+    // 2) for each entry, traverse/create directories, then write the file
+    return files.mapValues { (path, content) ->
+        // split on "/" (or "\" on Windows, if needed)
+        val segments = path.split(fileDelimiter)
+        // walk/build the directory path
+        var dir = root
+        for (segment in segments.dropLast(1)) {
+            dir = (dir.findChild(segment) as? VirtualDirectory)
+                ?: dir.addNewDirectory(segment)
+        }
+        // create the leaf file and set its contents
+
+        val file = VirtualParentalFile(segments.last(), content)
+        dir.addChild(file)
+        file
+    } to root
+}
 
 class Transformer(private val map: MappingSet, val patternMappings: List<PatternMapping> = emptyList()) {
     var classpath: Array<String>? = null
@@ -57,17 +87,12 @@ class Transformer(private val map: MappingSet, val patternMappings: List<Pattern
         referenceSources: Map<String, String>,
         processedSources: Map<String, String>,
     ): Map<String, Pair<String, List<Pair<Int, String>>>> {
-        val tmpDir = Files.createTempDirectory("remap")
         val processedTmpDir = Files.createTempDirectory("remap-processed")
         val disposable = Disposer.newDisposable()
         try {
             val combinedSource = referenceSources.plus(sources)
 
             for ((unitName, source) in combinedSource) {
-                val path = tmpDir.resolve(unitName)
-                Files.createDirectories(path.parent)
-                Files.write(path, source.toByteArray(StandardCharsets.UTF_8), StandardOpenOption.CREATE)
-
                 val processedSource = processedSources[unitName] ?: source
                 val processedPath = processedTmpDir.resolve(unitName)
                 Files.createDirectories(processedPath.parent)
@@ -77,9 +102,10 @@ class Transformer(private val map: MappingSet, val patternMappings: List<Pattern
             val config = CompilerConfiguration()
             config.put(CommonConfigurationKeys.MODULE_NAME, "main")
             jdkHome?.let { config.setupJdk(it) }
-            config.add<ContentRoot>(CLIConfigurationKeys.CONTENT_ROOTS, JavaSourceRoot(tmpDir.toFile(), ""))
-            val kotlinSourceRoot = createSourceRoot(tmpDir, false)
-            config.add<ContentRoot>(CLIConfigurationKeys.CONTENT_ROOTS, kotlinSourceRoot)
+
+            val (virtualFiles, tmpDir) = createMockFileSystem(combinedSource)
+
+            config.add<ContentRoot>(CLIConfigurationKeys.CONTENT_ROOTS, JavaSourceRoot(tmpDir.toNioPath(),"")) // SAD
             config.addAll<ContentRoot>(
                 CLIConfigurationKeys.CONTENT_ROOTS,
                 classpath!!.map { JvmClasspathRoot(File(it)) })
@@ -121,9 +147,7 @@ class Transformer(private val map: MappingSet, val patternMappings: List<Pattern
 
             val project = environment.project as MockProject
             val psiManager = PsiManager.getInstance(project)
-            val vfs =
-                VirtualFileManager.getInstance().getFileSystem(StandardFileSystems.FILE_PROTOCOL) as CoreLocalFileSystem
-            val virtualFiles = combinedSource.mapValues { vfs.findFileByIoFile(tmpDir.resolve(it.key).toFile())!! }
+
             val psiFiles = virtualFiles.mapValues { psiManager.findFile(it.value)!! }
             val ktFiles = psiFiles.values.filterIsInstance<KtFile>()
 
@@ -139,7 +163,7 @@ class Transformer(private val map: MappingSet, val patternMappings: List<Pattern
                 for ((unitName, source) in sources) {
                     if (!source.contains(annotationName)) continue
                     try {
-                        val patternFile = vfs.findFileByIoFile(tmpDir.resolve(unitName).toFile())!!
+                        val patternFile = virtualFiles[unitName]!!
                         val patternPsiFile = psiManager.findFile(patternFile)!!
                         patterns.read(patternPsiFile, processedSources[unitName]!!)
                     } catch (e: Exception) {
@@ -157,7 +181,7 @@ class Transformer(private val map: MappingSet, val patternMappings: List<Pattern
 
             val results = HashMap<String, Pair<String, List<Pair<Int, String>>>>()
             for (name in sources.keys) {
-                val file = vfs.findFileByIoFile(tmpDir.resolve(name).toFile())!!
+                val file = virtualFiles[name]!!
                 val psiFile = psiManager.findFile(file)!!
 
                 var (text, errors) = try {
@@ -182,7 +206,6 @@ class Transformer(private val map: MappingSet, val patternMappings: List<Pattern
             }
             return results
         } finally {
-            Files.walk(tmpDir).sorted(Comparator.reverseOrder()).forEach { Files.delete(it) }
             Files.walk(processedTmpDir).sorted(Comparator.reverseOrder()).forEach { Files.delete(it) }
             Disposer.dispose(disposable)
         }
